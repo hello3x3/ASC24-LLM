@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0,1,2 python dist_baseline.py --dataset ./scrambled_sampled_dataset.json --model /public/home/asc03/shujiuhe/datasets/Llama-2-70b-hf --num-samples=10 --batch_size=1
