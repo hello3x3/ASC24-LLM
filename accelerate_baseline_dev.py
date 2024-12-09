@@ -11,11 +11,9 @@ from tqdm import tqdm
 
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
-from accelerate.utils import gather_object
-
-
-accelerator = Accelerator()
-
+from accelerate import infer_auto_device_map, init_empty_weights, dispatch_model
+import torch.distributed as dist
+import os
 
 def collate_fn(batch):
     """ Custom collate_fn for DataLoader to handle padding for different sequence lengths """
@@ -36,78 +34,73 @@ def collate_fn(batch):
 def run_hf(
     requests: List[Tuple[str, int, int]],
     model: str,
-    tokenizer: PreTrainedTokenizerBase,
     trust_remote_code: bool,
     batch_size: int = 16,  # Batch size for inference
     max_input_length: int = 512  # Max length for padding
 ) -> float:
-
-    cuda_devices = torch.cuda.device_count()
-    max_memory = {cuda_device: "32GiB" for cuda_device in range(cuda_devices)}
-
-    llm = AutoModelForCausalLM.from_pretrained(
-        model,
-        # device_map={"": accelerator.process_index},
-        device_map="auto",
-        torch_dtype=torch.float16,
-        trust_remote_code=trust_remote_code,
-        max_memory=max_memory,
-    )
+    # if not dist.is_initialized():
+    #     dist.init_process_group(
+    #         backend="nccl",
+    #         init_method="env://",  # Use environment variables for setup
+    #     )
     
-    if llm.config.model_type == "llama":
-        # To enable padding in the HF backend.
-        tokenizer.pad_token = tokenizer.eos_token
-    # llm = llm.cuda()
+    accelerator = Accelerator()
+    with init_empty_weights():
+        llm = AutoModelForCausalLM.from_pretrained(
+            model,
+            torch_dtype=torch.float16,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=True
+        )
+    
+    # rank = int(os.environ["RANK"])
+    # world_size = int(os.environ["WORLD_SIZE"])
+    # device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    # if not dist.is_initialized():
+    #     dist.init_process_group(rank=rank, world_size=world_size)
+    # print(rank, world_size, device)
+    
+    cuda_devices = torch.cuda.device_count()
+    device_map = infer_auto_device_map(
+        model=llm,
+        dtype=torch.float16,
+        max_memory={cuda_device: "32GiB" for cuda_device in range(cuda_devices)},
+        no_split_module_classes=["LlamaDecoderLayer"],
+    )
+    print(device_map)
+
+    llm = dispatch_model(llm, device_map=device_map)
+    llm = accelerator.prepare(llm)
+    exit()
 
     input_num_tokens = []
     output_num_tokens = []
     start = time.perf_counter()
 
-    accelerator.wait_for_everyone()
-    with accelerator.split_between_processes(requests) as request:
-        results = dict(outputs=[], input_num_tokens=0, output_num_tokens=0)
-        # 使用 DataLoader 加载数据并进行批量处理
-        data_loader = DataLoader(request, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
-        for batch in tqdm(data_loader):
-            inputs, output_lens_batch = batch
-            input_ids_batch = inputs["input_ids"].cuda()
+    data_loader = DataLoader(requests, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
+    data_loader = accelerator.prepare(data_loader)
+    for batch in tqdm(data_loader):
+        inputs, output_lens_batch = batch
+        input_ids_batch = inputs["input_ids"].to(accelerator.device)
+        # input_ids_batch = inputs["input_ids"]
             
-            llm_outputs = llm.generate(
-                input_ids=input_ids_batch,
-                do_sample=False,
-                num_return_sequences=1,
-                num_beams=1,
-                temperature=1.0,
-                top_p=1.0,
-                use_cache=True,
-                max_new_tokens=max(output_lens_batch),
-            )
+        llm_outputs = llm.generate(
+            input_ids=input_ids_batch,
+            do_sample=False,
+            num_return_sequences=1,
+            num_beams=1,
+            temperature=1.0,
+            top_p=1.0,
+            use_cache=True,
+            max_new_tokens=max(output_lens_batch),
+        )
 
-            for idx in range(len(output_lens_batch)):
-                tokenizer.decode(llm_outputs[idx], skip_special_tokens=True)
-                input_num_tokens.append(len(input_ids_batch[idx]))
-                output_num_tokens.append(len(llm_outputs[idx]))
-                results["input_num_tokens"] += len(input_ids_batch[idx])
-                results["output_num_tokens"] += len(llm_outputs[idx])
-            
-        results = [results]
-
-    results_gathered = gather_object(results)
+        for idx in range(len(output_lens_batch)):
+            tokenizer.decode(llm_outputs[idx], skip_special_tokens=True)
+            input_num_tokens.append(len(input_ids_batch[idx]))
+            output_num_tokens.append(len(llm_outputs[idx]))
 
     end = time.perf_counter()
-    # print(">>> result:")
-    # print(results)
-    if accelerator.is_main_process:
-        end = time.perf_counter()
-        # print(">>> this is the main thread! <<<")
-        # print(">>> results_gathered:")
-        # print(results_gathered)
-        input_num_tokens = [sum([r["input_num_tokens"] for r in results_gathered])]
-        output_num_tokens = [sum([r["output_num_tokens"] for r in results_gathered])]
-        # print(">>> input_num_tokens:")
-        # print(input_num_tokens)
-        # print(">>> output_num_tokens:")
-        # print(output_num_tokens)
     return end - start, input_num_tokens, output_num_tokens
 
 
@@ -124,6 +117,8 @@ def main(args: argparse.Namespace):
         args.tokenizer,
         trust_remote_code=args.trust_remote_code
     )
+    tokenizer.pad_token = tokenizer.eos_token
+
     if args.dataset is None:
         # Synthesize a prompt with the given input length.
         prompt = "hi" * (args.input_len - 1)
@@ -136,7 +131,7 @@ def main(args: argparse.Namespace):
     if args.num_samples is not None:
         requests = requests[0: args.num_samples]
 
-    elapsed_time, input_num_tokens, output_num_tokens = run_hf(requests, args.model, tokenizer,  args.trust_remote_code)
+    elapsed_time, input_num_tokens, output_num_tokens = run_hf(requests, args.model, args.trust_remote_code, batch_size=args.batch_size)
     prompt_num_tokens = sum(prompt_len for prompt_len in input_num_tokens)
     total_num_tokens = sum(output_len for output_len in output_num_tokens)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s \n"
@@ -154,6 +149,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-len", type=int, default=None, help="Output length for each request")
     parser.add_argument("--num-samples", type=int, default=None, help="Number of first few samples used for inference test")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument('--trust-remote-code',
                         action='store_true',
                         help='trust remote code from huggingface')
