@@ -6,97 +6,50 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 from tqdm import tqdm
 
-import os
-from pathlib import Path
+from llama import Llama
 from torch.utils.data import DataLoader
-import torch.distributed as dist
-from fairscale.nn.model_parallel.initialize import (
-    get_model_parallel_rank,
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
 
 
-def collate_fn(batch):
-    """ Custom collate_fn for DataLoader to handle padding for different sequence lengths """
-    prompts, prompt_lens, output_lens = zip(*batch)
-    tokenizer.padding_side = "left"
-    inputs = tokenizer(
-        list(prompts),
-        padding="longest",
-        truncation=False,
-        pad_to_multiple_of=8,
-        return_tensors="pt",
-        add_special_tokens=False
-    )
-    tokenizer.padding_side = "right"
-    return inputs, output_lens
+def format_requests(requests: List[Tuple[str, int, int]]):
+    prompts, inp_lens, gen_lens = zip(*requests)
+    prompts = list(prompts)
+    return prompts, (inp_lens, gen_lens)
 
 
-def run_hf(
+def run_transformer(
     requests: List[Tuple[str, int, int]],
     model: str,
     trust_remote_code: bool,
-    batch_size: int = 16,  # Batch size for inference
-    max_input_length: int = 512  # Max length for padding
+    batch_size: int = 4,  # Batch size for inference
 ) -> float:
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group("nccl")
-    if not model_parallel_is_initialized():
-        model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
-        initialize_model_parallel(model_parallel_size)
     
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    checkpoints = sorted(Path("/public/home/asc03/shujiuhe/datasets/Llama-2-70b-hf").glob("*.pth"))
-    print(checkpoints)
-    print(get_model_parallel_rank())
-    exit()
-
-    # cuda_devices = torch.cuda.device_count()
-    # max_memory = {cuda_device: "32GiB" for cuda_device in range(cuda_devices)}
-
-    llm = AutoModelForCausalLM.from_pretrained(
-        model,
-        # device_map="auto",
-        torch_dtype=torch.float16,
-        trust_remote_code=trust_remote_code,
-        # max_memory=max_memory,
-        low_cpu_mem_usage=True,
+    llm = Llama.build(
+        ckpt_dir=model,
+        max_seq_len=1024,
+        max_batch_size=batch_size,
     )
-    exit()
 
+    data_loader = DataLoader(requests, batch_size=batch_size, collate_fn=format_requests, shuffle=False)
+    
     input_num_tokens = []
     output_num_tokens = []
     start = time.perf_counter()
 
-    # 使用 DataLoader 加载数据并进行批量处理
-    data_loader = DataLoader(requests, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
-
-    for batch in tqdm(data_loader):
-        inputs, output_lens_batch = batch
-        input_ids_batch = inputs["input_ids"].cuda()
+    for prompts, (inp_lens, gen_lens) in tqdm(data_loader):
         
-        llm_outputs = llm.generate(
-            input_ids=input_ids_batch,
-            do_sample=False,
-            num_return_sequences=1,
-            num_beams=1,
+        out_lens = llm.text_completion(
+            prompts,
+            max_gen_len=max(gen_lens),
             temperature=1.0,
             top_p=1.0,
-            use_cache=True,
-            max_new_tokens=max(output_lens_batch),
         )
 
-        for idx in range(len(output_lens_batch)):
-            tokenizer.decode(llm_outputs[idx], skip_special_tokens=True)
-            input_num_tokens.append(len(input_ids_batch[idx]))
-            output_num_tokens.append(len(llm_outputs[idx]))
-
-
+        for i in range(len(inp_lens)):
+            input_num_tokens.append(inp_lens[i])
+            output_num_tokens.append(len(out_lens[i]))
+    
     end = time.perf_counter()
     return end - start, input_num_tokens, output_num_tokens
 
@@ -108,13 +61,6 @@ def main(args: argparse.Namespace):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-
-    # Sample the requests.
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer,
-        trust_remote_code=args.trust_remote_code
-    )
-    tokenizer.pad_token = tokenizer.eos_token
 
     if args.dataset is None:
         # Synthesize a prompt with the given input length.
@@ -128,7 +74,7 @@ def main(args: argparse.Namespace):
     if args.num_samples is not None:
         requests = requests[0: args.num_samples]
 
-    elapsed_time, input_num_tokens, output_num_tokens = run_hf(requests, args.model, args.trust_remote_code, batch_size=args.batch_size)
+    elapsed_time, input_num_tokens, output_num_tokens = run_transformer(requests, args.model, args.trust_remote_code, batch_size=args.batch_size)
     prompt_num_tokens = sum(prompt_len for prompt_len in input_num_tokens)
     total_num_tokens = sum(output_len for output_len in output_num_tokens)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s \n"
