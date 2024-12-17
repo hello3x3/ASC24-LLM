@@ -23,11 +23,12 @@ def run_transformer(
     model: str,
     trust_remote_code: bool,
     batch_size: int = 4,  # Batch size for inference
+    max_seq_len: int = 1024,
 ) -> float:
     
     llm = Llama.build(
         ckpt_dir=model,
-        max_seq_len=1024,
+        max_seq_len=max_seq_len,
         max_batch_size=batch_size,
     )
 
@@ -38,14 +39,16 @@ def run_transformer(
     start = time.perf_counter()
 
     for prompts, (inp_lens, gen_lens) in tqdm(data_loader):
-        
-        out_lens = llm.text_completion(
+
+        results, out_lens = llm.text_completion(
             prompts,
-            max_gen_len=max(gen_lens),
+            max_gen_len=min(max(gen_lens), max_seq_len),
             temperature=1.0,
             top_p=1.0,
         )
-
+        
+        print(results)
+        
         for i in range(len(inp_lens)):
             input_num_tokens.append(inp_lens[i])
             output_num_tokens.append(len(out_lens[i]))
@@ -56,7 +59,6 @@ def run_transformer(
 
 
 def main(args: argparse.Namespace):
-    global tokenizer
     print(args)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -74,7 +76,13 @@ def main(args: argparse.Namespace):
     if args.num_samples is not None:
         requests = requests[0: args.num_samples]
 
-    elapsed_time, input_num_tokens, output_num_tokens = run_transformer(requests, args.model, args.trust_remote_code, batch_size=args.batch_size)
+    elapsed_time, input_num_tokens, output_num_tokens = run_transformer(
+        requests,
+        args.model,
+        args.trust_remote_code,
+        batch_size=args.batch_size,
+        max_seq_len=args.max_seq_len
+    )
     prompt_num_tokens = sum(prompt_len for prompt_len in input_num_tokens)
     total_num_tokens = sum(output_len for output_len in output_num_tokens)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s \n"
@@ -93,6 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples", type=int, default=None, help="Number of first few samples used for inference test")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument('--trust-remote-code',
                         action='store_true',
                         help='trust remote code from huggingface')

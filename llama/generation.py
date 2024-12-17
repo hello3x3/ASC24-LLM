@@ -211,8 +211,7 @@ class Llama:
                 }
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
             ]
-        # return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
-        return generation_tokens
+        return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens], generation_tokens
 
     def chat_completion(
         self,
